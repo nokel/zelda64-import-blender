@@ -2,6 +2,7 @@
 # Import models from Zelda64 files into Blender
 # Copyright (C) 2013 SoulofDeity
 # Copyright (C) 2020 Dragorn421
+# Copyright (C) 2025 Nokel
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License as published by
@@ -18,11 +19,11 @@
 
 bl_info = {
     "name":        "Zelda64 Importer",
-    "version":     (2, 5),
-    "author":      "SoulofDeity",
-    "blender":     (2, 6, 0),
+    "version":     (3, 0),
+    "author":      "SoulofDeity, Dragorn421", "Nokel",
+    "blender":     (3, 4, 0),
     "location":    "File > Import-Export",
-    "description": "Import Zelda64 - updated in 2020",
+    "description": "Import Zelda64 - updated for Blender 3.4.1",
     "warning":     "",
     "wiki_url":    "https://github.com/Dragorn421/zelda64-import-blender",
     "tracker_url": "https://github.com/Dragorn421/zelda64-import-blender",
@@ -278,31 +279,62 @@ class Tile:
                     os.rename(oldName, newName)
                     self.current_texture_file_path = newName
         try:
-            tex_name = prefix + ('tex_%s_%08X' % (fmtName,self.data))
-            tex = bpy.data.textures.new(name=tex_name, type='IMAGE')
             img = load_image(self.current_texture_file_path)
-            if img:
-                tex.image = img
-                if int(self.clip.x) & 2 != 0 and enableTexClampBlender:
-                    img.use_clamp_x = True
-                if int(self.clip.y) & 2 != 0 and enableTexClampBlender:
-                    img.use_clamp_y = True
+            
             mtl_name = prefix + ('mtl_%08X' % self.data)
             mtl = bpy.data.materials.new(name=mtl_name)
-            if enableShadelessMaterials:
-                mtl.use_shadeless = True
-            mt = mtl.texture_slots.add()
-            mt.texture = tex
-            mt.texture_coords = 'UV'
-            mt.use_map_color_diffuse = True
+            mtl.use_nodes = True
+            
+            nodes = mtl.node_tree.nodes
+            links = mtl.node_tree.links
+            
+            nodes.clear()
+            
+            bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+            bsdf.location = (200, 0)
+            material_output = nodes.new('ShaderNodeOutputMaterial')
+            material_output.location = (500, 0)
+            
+            tex_node = nodes.new('ShaderNodeTexImage')
+            tex_node.location = (-500, 0)
+            if img:
+                tex_node.image = img
+                
+            if enableTexClampBlender:
+                clamp_x = int(self.clip.x) & 2 != 0
+                clamp_y = int(self.clip.y) & 2 != 0
+                if clamp_x or clamp_y:
+                    tex_node.extension = 'EXTEND'
+                else:
+                    tex_node.extension = 'REPEAT'
+            
+            vertex_color = nodes.new('ShaderNodeVertexColor')
+            vertex_color.location = (-500, -250)
+            
+            mix_rgb = nodes.new('ShaderNodeMix')
+            mix_rgb.data_type = 'RGBA'
+            mix_rgb.location = (-200, 0)
+            mix_rgb.blend_type = 'MULTIPLY'
+            mix_rgb.inputs['Factor'].default_value = 1.0
+            
+            links.new(mix_rgb.inputs[6], tex_node.outputs['Color'])
+            links.new(mix_rgb.inputs[7], vertex_color.outputs['Color'])
+            links.new(bsdf.inputs['Base Color'], mix_rgb.outputs[2])
+            
+            # Handle transparency
             if use_transparency:
-                mt.use_map_alpha = True
-                tex.use_mipmap = True
-                tex.use_interpolation = True
-                tex.use_alpha = True
-                mtl.use_transparency = True
-                mtl.alpha = 0.0
-                mtl.game_settings.alpha_blend = 'ALPHA'
+                links.new(bsdf.inputs['Alpha'], tex_node.outputs['Alpha'])
+                mtl.blend_method = 'BLEND'
+                mtl.shadow_method = 'CLIP'
+            
+            if enableShadelessMaterials:
+                emission = nodes.new('ShaderNodeEmission')
+                emission.location = (200, -300)
+                links.new(emission.inputs['Color'], mix_rgb.outputs[2])
+                links.new(material_output.inputs['Surface'], emission.outputs['Emission'])
+            else:
+                links.new(material_output.inputs['Surface'], bsdf.outputs['BSDF'])
+            
             return mtl
         except:
             log.exception('Failed to create material mtl_%08X %r', self.data)
@@ -602,39 +634,77 @@ class Mesh:
         me_name = prefix + (name_format % ('me_%08X' % offset))
         me = bpy.data.meshes.new(me_name)
         ob = bpy.data.objects.new(prefix + (name_format % ('ob_%08X' % offset)), me)
-        bpy.context.scene.objects.link(ob)
-        bpy.context.scene.objects.active = ob
+        bpy.context.collection.objects.link(ob)
+        bpy.context.view_layer.objects.active = ob
+
         me.vertices.add(len(self.verts))
 
         for i in range(len(self.verts)):
             me.vertices[i].co = self.verts[i]
-        me.tessfaces.add(len(self.faces))
-        vcd = me.tessface_vertex_colors.new().data
-        for i in range(len(self.faces)):
-            me.tessfaces[i].vertices = self.faces[i]
-            me.tessfaces[i].use_smooth = self.faces_use_smooth[i]
-
-            vcd[i].color1 = self.colors[i * 3]
-            vcd[i].color2 = self.colors[i * 3 + 1]
-            vcd[i].color3 = self.colors[i * 3 + 2]
-        uvd = me.tessface_uv_textures.new().data
+        
+        # Calculate total loop count for all faces
+        total_loops = sum(len(face) for face in self.faces)
+        me.loops.add(total_loops)
+        me.polygons.add(len(self.faces))
+        
+        # Create vertex color layer
+        color_layer = me.vertex_colors.new()
+        
+        # Set loop vertex indices and polygon properties
+        loop_start = 0
+        loop_verts = []
+        for i, face in enumerate(self.faces):
+            # Set polygon properties
+            me.polygons[i].loop_start = loop_start
+            me.polygons[i].loop_total = len(face)
+            me.polygons[i].use_smooth = self.faces_use_smooth[i]
+            
+            # Collect loop vertex indices
+            for vertex_index in face:
+                loop_verts.append(vertex_index)
+            
+            # Set vertex colors for this face's loops
+            for j in range(len(face)):
+                loop_idx = loop_start + j
+                color_idx = i * 3 + min(j, 2)  # Use last color for quads
+                if color_idx < len(self.colors):
+                    # Convert to list and add alpha channel
+                    rgb = list(self.colors[color_idx][:3])
+                    color_layer.data[loop_idx].color = rgb + [1.0]
+            
+            loop_start += len(face)
+        
+        # Set all loop vertex indices at once
+        me.loops.foreach_set("vertex_index", loop_verts)
+        
+        # Create UV layer and set UV coordinates
+        uv_layer = me.uv_layers.new()
+        loop_start = 0
         for i in range(len(self.faces)):
             material = self.uvs[i * 4]
             if material:
                 if not material.name in me.materials:
                     me.materials.append(material)
-                uvd[i].image = material.texture_slots[0].texture.image
-            uvd[i].uv[0] = self.uvs[i * 4 + 1]
-            uvd[i].uv[1] = self.uvs[i * 4 + 2]
-            uvd[i].uv[2] = self.uvs[i * 4 + 3]
+                me.polygons[i].material_index = len(me.materials) - 1
+            
+            # Set UV coordinates for this face's loops
+            face_len = len(self.faces[i])
+            for j in range(face_len):
+                loop_idx = loop_start + j
+                uv_idx = i * 4 + 1 + min(j, 2)  # Use appropriate UV index
+                if uv_idx < len(self.uvs):
+                    uv_layer.data[loop_idx].uv = self.uvs[uv_idx]
+            
+            loop_start += face_len
         me.calc_normals()
         me.validate()
         me.update()
+        
 
-        log.debug('me =\n%r', me)
-        log.debug('verts =\n%r', self.verts)
-        log.debug('faces =\n%r', self.faces)
-        log.debug('normals =\n%r', self.normals)
+        
+
+
+
 
         if use_normals:
             # fixme make sure normals are set in the right order
@@ -650,7 +720,7 @@ class Mesh:
 
         if hierarchy:
             for name, vgroup in self.vgroups.items():
-                grp = ob.vertex_groups.new(name)
+                grp = ob.vertex_groups.new(name=name)
                 for v in vgroup:
                     grp.add([v], 1.0, 'REPLACE')
             ob.parent = hierarchy.armature
@@ -737,12 +807,12 @@ class Hierarchy:
         if (bpy.context.active_object):
             bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
         for i in bpy.context.selected_objects:
-            i.select = False
+            i.select_set(False)
         self.armature = bpy.data.objects.new(self.name, bpy.data.armatures.new("%s_armature" % self.name))
-        self.armature.show_x_ray = True
-        self.armature.data.draw_type = 'STICK'
-        bpy.context.scene.objects.link(self.armature)
-        bpy.context.scene.objects.active = self.armature
+        self.armature.show_in_front = True
+        self.armature.data.display_type = 'STICK'
+        bpy.context.collection.objects.link(self.armature)
+        bpy.context.view_layer.objects.active = self.armature
         bpy.ops.object.mode_set(mode='EDIT', toggle=False)
         for i in range(self.limbCount):
             bone = self.armature.data.edit_bones.new("limb_%02i" % i)
@@ -823,13 +893,16 @@ class F3DZEX:
             log.exception('Could not read displaylists.txt')
 
     def loadSegment(self, seg, path):
+        log = getLogger('F3DZEX.loadSegment')
+        if not path or not os.path.isfile(path):
+            log.debug('No file found to load segment 0x%02X from', seg)
+            return
         try:
-            file = open(path, 'rb')
-            self.segment[seg] = file.read()
-            file.close()
-        except:
-            getLogger('F3DZEX.loadSegment').error('Could not load segment 0x%02X data from %s' % (seg, path))
-            pass
+            with open(path, 'rb') as file:
+                self.segment[seg] = file.read()
+            log.debug('Successfully loaded segment 0x%02X from %s (%d bytes)', seg, path, len(self.segment[seg]))
+        except Exception as e:
+            log.error('Could not load segment 0x%02X data from %s: %s', seg, path, str(e))
 
     def locateHierarchies(self):
         log = getLogger('F3DZEX.locateHierarchies')
@@ -1027,14 +1100,37 @@ class F3DZEX:
         import bmesh
         bm = bmesh.new()
         transform = Matrix.Scale(scaleFactor, 4)
-        bm.faces.new(bm.verts.new(transform * Vector((cos[i][0], 0, cos[i][1]))) for i in range(4))
+        bm.faces.new(bm.verts.new(transform @ Vector((cos[i][0], 0, cos[i][1]))) for i in range(4))
         bm.to_mesh(me)
         bm.free()
         del bmesh
-        me.uv_textures.new().data[0].image = jfifImage
+        # Create UV layer and material for background image (Blender 3.x compatible)
+        if not me.uv_layers:
+            me.uv_layers.new()
+        # Create material with image texture for background
+        if jfifImage:
+            bg_material = bpy.data.materials.new(name="BackgroundImage")
+            bg_material.use_nodes = True
+            nodes = bg_material.node_tree.nodes
+            nodes.clear()
+            
+            # Create shader nodes
+            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+            tex_image = nodes.new(type='ShaderNodeTexImage')
+            output = nodes.new(type='ShaderNodeOutputMaterial')
+            
+            # Set image
+            tex_image.image = jfifImage
+            
+            # Connect nodes
+            bg_material.node_tree.links.new(tex_image.outputs[0], bsdf.inputs[0])
+            bg_material.node_tree.links.new(bsdf.outputs[0], output.inputs[0])
+            
+            # Add material to mesh
+            me.materials.append(bg_material)
         ob = bpy.data.objects.new(self.prefix + (name_format % jfifDataStart), me)
         ob.location.z = max(max(v.co.z for v in obj.data.vertices) for obj in bpy.context.scene.objects if obj.type == 'MESH')
-        bpy.context.scene.objects.link(ob)
+        bpy.context.collection.objects.link(ob)
         return ob
 
     def importMap(self):
@@ -1201,8 +1297,8 @@ class F3DZEX:
                 else:
                     log.info("    0x%02X : n/a" % i)
         if len(self.hierarchy) > 0:
-            bpy.context.scene.objects.active = self.hierarchy[0].armature
-            self.hierarchy[0].armature.select = True
+            bpy.context.view_layer.objects.active = self.hierarchy[0].armature
+            self.hierarchy[0].armature.select_set(True)
             bpy.ops.object.mode_set(mode='POSE', toggle=False)
             global AnimtoPlay
             if (AnimtoPlay > 0):
@@ -1223,6 +1319,11 @@ class F3DZEX:
                     hierarchy = max(self.hierarchy, key=lambda h:h.limbCount)
                     armature = hierarchy.armature
                     log.info('Building animations using armature %s in %s', armature.data.name, armature.name)
+                    
+                    bpy.context.view_layer.objects.active = armature
+                    armature.select_set(True)
+                    bpy.ops.object.mode_set(mode='POSE', toggle=False)
+                    
                     for i in range(len(self.animation)):
                         AnimtoPlay = i + 1
                         log.info("   Loading animation %d/%d 0x%08X", AnimtoPlay, len(self.animation), self.offsetAnims[AnimtoPlay-1])
@@ -1234,10 +1335,17 @@ class F3DZEX:
                     for h in self.hierarchy:
                         h.armature.animation_data.action = action
                     bpy.context.scene.frame_end = max(self.durationAnims)
+                    
+                    if bpy.context.active_object and bpy.context.active_object.mode != 'OBJECT':
+                        bpy.ops.object.mode_set(mode='OBJECT')
                 else:
                     self.locateLinkAnimations()
+                    if bpy.context.active_object and bpy.context.active_object.mode != 'OBJECT':
+                        bpy.ops.object.mode_set(mode='OBJECT')
             else:
                 log.info("    Load anims OFF.")
+                if bpy.context.active_object and bpy.context.active_object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
 
         if importStrategy == 'NO_DETECTION':
             pass
@@ -1648,6 +1756,12 @@ class F3DZEX:
         segment = self.segment
         RX, RY, RZ = 0,0,0
         BoneCount  = hierarchy.limbCount
+        
+        # Ensure we're in the correct mode and have the armature selected
+        bpy.context.view_layer.objects.active = hierarchy.armature
+        hierarchy.armature.select_set(True)
+        bpy.ops.object.mode_set(mode='POSE')
+        
         bpy.context.scene.tool_settings.use_keyframe_insert_auto = True
         bonesIndx = [0,-90,0,0,0,0,0,0,0,90,0,0,0,180,0,0,-180,0,0,0,0]
         bonesIndy = [0,90,0,0,0,90,0,0,90,-90,-90,-90,0,0,0,90,0,0,90,0,0]
@@ -1657,35 +1771,28 @@ class F3DZEX:
         for i in range(BoneCount):
             bIndx = ((BoneCount-1) - i)
             if (i > -1):
-                bone = hierarchy.armature.bones["limb_%02i" % (bIndx)]
-                bone.select = True
-                bpy.ops.transform.rotate(value = radians(bonesIndx[bIndx]), axis=(0, 0, 0), constraint_axis=(True, False, False))
-                bpy.ops.transform.rotate(value = radians(bonesIndz[bIndx]), axis=(0, 0, 0), constraint_axis=(False, False, True))
-                bpy.ops.transform.rotate(value = radians(bonesIndy[bIndx]), axis=(0, 0, 0), constraint_axis=(False, True, False))
-                bpy.ops.pose.select_all(action="DESELECT")
+                bone = hierarchy.armature.pose.bones["limb_%02i" % (bIndx)]
+                bone.rotation_euler = (radians(bonesIndx[bIndx]), radians(bonesIndy[bIndx]), radians(bonesIndz[bIndx]))
+                bone.keyframe_insert(data_path='rotation_euler')
 
-        hierarchy.armature.bones["limb_00"].select = True ## Translations
-        bpy.ops.transform.translate(value =(0, 0, 0), constraint_axis=(True, False, False))
-        bpy.ops.transform.translate(value = (0, 0, 50), constraint_axis=(False, False, True))
-        bpy.ops.transform.translate(value = (0, 0, 0), constraint_axis=(False, True, False))
-        bpy.ops.pose.select_all(action="DESELECT")
+        root_bone = hierarchy.armature.pose.bones["limb_00"]
+        root_bone.location.z += 50
+        root_bone.keyframe_insert(data_path='location')
         bpy.context.scene.tool_settings.use_keyframe_insert_auto = False
 
         for i in range(BoneCount):
             bIndx = i
             if (i > -1):
-                bone = hierarchy.armature.bones["limb_%02i" % (bIndx)]
-                bone.select = True
-                bpy.ops.transform.rotate(value = radians(-bonesIndy[bIndx]), axis=(0, 0, 0), constraint_axis=(False, True, False))
-                bpy.ops.transform.rotate(value = radians(-bonesIndz[bIndx]), axis=(0, 0, 0), constraint_axis=(False, False, True))
-                bpy.ops.transform.rotate(value = radians(-bonesIndx[bIndx]), axis=(0, 0, 0), constraint_axis=(True, False, False))
-                bpy.ops.pose.select_all(action="DESELECT")
+                bone = hierarchy.armature.pose.bones["limb_%02i" % (bIndx)]
+                bone.rotation_euler = (-radians(bonesIndx[bIndx]), -radians(bonesIndy[bIndx]), -radians(bonesIndz[bIndx]))
+                bone.keyframe_insert(data_path='rotation_euler')
 
-        hierarchy.armature.bones["limb_00"].select = True ## Translations
-        bpy.ops.transform.translate(value =(0, 0, 0), constraint_axis=(True, False, False))
-        bpy.ops.transform.translate(value = (0, 0, -50), constraint_axis=(False, False, True))
-        bpy.ops.transform.translate(value = (0, 0, 0), constraint_axis=(False, True, False))
-        bpy.ops.pose.select_all(action="DESELECT")
+        root_bone = hierarchy.armature.pose.bones["limb_00"]
+        root_bone.location.z -= 50
+        root_bone.keyframe_insert(data_path='location')
+        
+        # Return to Object mode after T-Pose setup
+        bpy.ops.object.mode_set(mode='OBJECT')
 
     def buildLinkAnimations(self, hierarchy, newframe):
         global AnimtoPlay
@@ -1710,7 +1817,7 @@ class F3DZEX:
         else:
           currentanim = 0
 
-        log.info("currentanim: %d frameCurrent: %d", currentanim+1, frameCurrent+1)
+
         AnimationOffset = self.offsetAnims[currentanim]
         TAnimationOffset = self.offsetAnims[currentanim]
         AniSeg = AnimationOffset >> 24
@@ -1761,29 +1868,21 @@ class F3DZEX:
             RYY = (-RZ)
             RZZ = (RY)
 
-            log.trace('limb: %d RX %d RZ %d RY %d anim: %d frame: %d', bIndx, int(RXX), int(RZZ), int(RYY), currentanim+1, frameCurrent+1)
-            if (i > -1):
-                bone = hierarchy.armature.bones["limb_%02i" % (bIndx)]
-                bone.select = True
-                bpy.ops.transform.rotate(value = radians(RXX), axis=(0, 0, 0), constraint_axis=(True, False, False))
-                bpy.ops.transform.rotate(value = radians(RZZ), axis=(0, 0, 0), constraint_axis=(False, False, True))
-                bpy.ops.transform.rotate(value = radians(RYY), axis=(0, 0, 0), constraint_axis=(False, True, False))
-                bpy.ops.pose.select_all(action="DESELECT")
 
-        hierarchy.armature.bones["limb_00"].select = True ## Translations
-        bpy.ops.transform.translate(value =(newLocx, 0, 0), constraint_axis=(True, False, False))
-        bpy.ops.transform.translate(value = (0, 0, newLocz), constraint_axis=(False, False, True))
-        bpy.ops.transform.translate(value = (0, newLocy, 0), constraint_axis=(False, True, False))
-        bpy.ops.pose.select_all(action="DESELECT")
+            if (i > -1):
+                bone = hierarchy.armature.pose.bones["limb_%02i" % (bIndx)]
+                bone.rotation_euler = (radians(RXX), radians(RYY), radians(RZZ))
+                bone.keyframe_insert(data_path='rotation_euler')
+
+        root_bone = hierarchy.armature.pose.bones["limb_00"]
+        root_bone.location += mathutils.Vector((newLocx, newLocy, newLocz))
+        root_bone.keyframe_insert(data_path='location')
 
         if (frameCurrent < (frameTotal - 1)):## Next Frame ### Could have done some math here but... just reverse previus frame, so it just repose.
             bpy.context.scene.tool_settings.use_keyframe_insert_auto = False
 
-            hierarchy.armature.bones["limb_00"].select = True ## Translations
-            bpy.ops.transform.translate(value = (-newLocx, 0, 0), constraint_axis=(True, False, False))
-            bpy.ops.transform.translate(value = (0, 0, -newLocz), constraint_axis=(False, False, True))
-            bpy.ops.transform.translate(value = (0, -newLocy, 0), constraint_axis=(False, True, False))
-            bpy.ops.pose.select_all(action="DESELECT")
+            root_bone = hierarchy.armature.pose.bones["limb_00"]
+            root_bone.location -= mathutils.Vector((newLocx, newLocy, newLocz))
 
             rot_offset = AnimationOffset
             rot_offset += (frameCurrent * (BoneCount * 6 + 8))
@@ -1804,14 +1903,11 @@ class F3DZEX:
                 RYY = (RZ)
                 RZZ = (-RY)
 
-                log.trace("limb: %d RX %d RZ %d RY %d anim: %d frame: %d", i, int(RXX), int(RZZ), int(RYY), currentanim+1, frameCurrent+1)
+
                 if (i > -1):
-                    bone = hierarchy.armature.bones["limb_%02i" % (i)]
-                    bone.select = True
-                    bpy.ops.transform.rotate(value = radians(RYY), axis=(0, 0, 0), constraint_axis=(False, True, False))
-                    bpy.ops.transform.rotate(value = radians(RZZ), axis=(0, 0, 0), constraint_axis=(False, False, True))
-                    bpy.ops.transform.rotate(value = radians(RXX), axis=(0, 0, 0), constraint_axis=(True, False, False))
-                    bpy.ops.pose.select_all(action="DESELECT")
+                    bone = hierarchy.armature.pose.bones["limb_%02i" % (i)]
+                    bone.rotation_euler = (radians(RXX), radians(RYY), radians(RZZ))
+                    bone.keyframe_insert(data_path='rotation_euler')
 
             bpy.context.scene.frame_end += 1
             bpy.context.scene.frame_current += 1
@@ -1865,20 +1961,18 @@ class F3DZEX:
         rot_vals_cache = []
         def rot_vals(index, errorDefault=0):
             if index < 0 or (rot_vals_max_length and index >= rot_vals_max_length):
-                log.trace('index in rotations table %d is out of bounds (rotations table is <= %d long)', index, rot_vals_max_length)
+
                 return errorDefault
             if index >= len(rot_vals_cache):
                 rot_vals_cache.extend(unpack_from(">h", segment[AniSeg], (rot_vals_addr) + (j * 2))[0] for j in range(len(rot_vals_cache),index+1))
-                log.trace('Computed rot_vals_cache up to %d %r', index, rot_vals_cache)
+
             return rot_vals_cache[index]
 
         bpy.context.scene.tool_settings.use_keyframe_insert_auto = True
         bpy.context.scene.frame_end = frameTotal
         bpy.context.scene.frame_current = frameCurrent + 1
 
-        log.log(
-            logging.INFO if (frameCurrent + 1) % min(20, max(min(10, frameTotal), frameTotal // 3)) == 0 else logging.DEBUG,
-            "anim: %d/%d frame: %d/%d", currentanim+1, self.animTotal, frameCurrent+1, frameTotal)
+
 
         ## Translations
         Trot_indx = unpack_from(">h", segment[AniSeg], RotIndexoffset)[0]
@@ -1900,14 +1994,13 @@ class F3DZEX:
         newLocx =  TRX * scaleFactor
         newLocz =  TRZ * scaleFactor
         newLocy = -TRY * scaleFactor
-        log.trace("X %d Y %d Z %d", int(TRX), int(TRY), int(TRZ))
 
-        log.trace("       %d Frames %d still values %f tracks",frameTotal, Limit, ((rot_vals_max_length - Limit) / frameTotal)) # what is this debug message?
+
+
         for i in range(BoneCountMax):
             bIndx = ((BoneCountMax-1) - i) # Had to reverse here, cuz didn't find a way to rotate bones on LOCAL space, start rotating from last to first bone on hierarchy GLOBAL.
 
             if RotIndexoffset + (bIndx * 6) + 10 + 2 > len(segment[AniSeg]):
-                log.trace('Ignoring bone %d in animation %d, rotation table does not have that many entries', bIndx, AnimtoPlay)
                 continue
 
             rot_indexx = unpack_from(">h", segment[AniSeg], RotIndexoffset + (bIndx * 6) + 6)[0]
@@ -1941,15 +2034,11 @@ class F3DZEX:
             RYY = radians(RY)
             RZZ = radians(RZ)
 
-            log.trace("limb: %d XIdx: %d %d YIdx: %d %d ZIdx: %d %d frameTotal: %d", bIndx, rot_indexx, rot_indx, rot_indexy, rot_indy, rot_indexz, rot_indz, frameTotal)
-            log.trace("limb: %d RX %d RZ %d RY %d anim: %d frame: %d frameTotal: %d", bIndx, int(RX), int(RZ), int(RY), currentanim+1, frameCurrent+1, frameTotal)
+
             if (bIndx > -1):
-                bone = armature.data.bones["limb_%02i" % (bIndx)]
-                bone.select = True
-                bpy.ops.transform.rotate(value = RXX, axis=(0, 0, 0), constraint_axis=(True, False, False))
-                bpy.ops.transform.rotate(value = RZZ, axis=(0, 0, 0), constraint_axis=(False, False, True))
-                bpy.ops.transform.rotate(value = RYY, axis=(0, 0, 0), constraint_axis=(False, True, False))
-                bpy.ops.pose.select_all(action="DESELECT")
+                bone = armature.pose.bones["limb_%02i" % (bIndx)]
+                bone.rotation_euler = (RXX, RYY, RZZ)
+                bone.keyframe_insert(data_path='rotation_euler')
 
         bone = armature.pose.bones["limb_00"]
         bone.location += mathutils.Vector((newLocx,newLocz,-newLocy))
@@ -1965,7 +2054,6 @@ class F3DZEX:
             bIndx = i
 
             if RotIndexoffset + (bIndx * 6) + 10 + 2 > len(segment[AniSeg]):
-                log.trace('Ignoring bone %d in animation %d, rotation table does not have that many entries', bIndx, AnimtoPlay)
                 continue
 
             rot_indexx = unpack_from(">h", segment[AniSeg], RotIndexoffset + (bIndx * 6) + 6)[0]
@@ -1999,137 +2087,136 @@ class F3DZEX:
             RYY = radians(RY)
             RZZ = radians(RZ)
 
-            log.trace("limb: %d XIdx: %d %d YIdx: %d %d ZIdx: %d %d frameTotal: %d", i, rot_indexx, rot_indx, rot_indexy, rot_indy, rot_indexz, rot_indz, frameTotal)
-            log.trace("limb: %d RX %d RZ %d RY %d anim: %d frame: %d frameTotal: %d", bIndx, int(RX), int(RZ), int(RY), currentanim+1, frameCurrent+1, frameTotal)
+
             if (bIndx > -1):
-                bone = armature.data.bones["limb_%02i" % (bIndx)]
-                bone.select = True
-                bpy.ops.transform.rotate(value = RYY, axis=(0, 0, 0), constraint_axis=(False, True, False))
-                bpy.ops.transform.rotate(value = RZZ, axis=(0, 0, 0), constraint_axis=(False, False, True))
-                bpy.ops.transform.rotate(value = RXX, axis=(0, 0, 0), constraint_axis=(True, False, False))
-                bpy.ops.pose.select_all(action="DESELECT")
+                bone = armature.pose.bones["limb_%02i" % (bIndx)]
+                bone.rotation_euler = (RXX, RYY, RZZ)
+                bone.keyframe_insert(data_path='rotation_euler')
 
         if (frameCurrent < (frameTotal - 1)):## Next Frame
             frameCurrent += 1
             self.buildAnimations(hierarchyMostBones, frameCurrent)
         else:
             bpy.context.scene.frame_current = 1
+            # Return to Object mode after animation import
+            if armature and bpy.context.active_object == armature:
+                bpy.ops.object.mode_set(mode='OBJECT')
 
 global Animscount
 Animscount = 1
 
-class ImportZ64(bpy.types.Operator, ImportHelper):
+class IMPORT_OT_zelda64(bpy.types.Operator, ImportHelper):
     """Load a Zelda64 File"""
-    bl_idname    = "file.zobj2020"
+    bl_idname = "import_scene.zelda64"
     bl_label     = "Import Zelda64"
     bl_options   = {'PRESET', 'UNDO'}
     filename_ext = ".zobj"
-    filter_glob  = StringProperty(default="*.zobj;*.zroom;*.zmap", options={'HIDDEN'})
+    filter_glob: StringProperty(default="*.zobj;*.zroom;*.zmap", options={'HIDDEN'})
 
-    files = CollectionProperty(
+    files: CollectionProperty(
         name="Files",
         type=bpy.types.OperatorFileListElement,)
-    directory = StringProperty(subtype='DIR_PATH')
+    directory: StringProperty(subtype='DIR_PATH')
 
-    loadOtherSegments = BoolProperty(name="Load Data From Other Segments",
+    loadOtherSegments: BoolProperty(name="Load Data From Other Segments",
                                     description="Load data from other segments",
                                     default=True,)
-    importType = EnumProperty(
+    importType: EnumProperty(
         name='Import type',
         items=(('AUTO', 'Auto', 'Assume Room File if .zroom or .zmap, otherwise assume Object File'),
                ('OBJECT', 'Object File', 'Assume the file being imported is an object file'),
                ('ROOM', 'Room File', 'Assume the file being imported is a room file'),),
         description='What to assume the file being imported is',
         default='AUTO',)
-    importStrategy = EnumProperty(name='Detect DLists',
+    importStrategy: EnumProperty(name='Detect DLists',
                                  items=(('NO_DETECTION', 'Minimum', 'Maps: only use headers\nObjects: only use hierarchies\nOnly this option will not create unexpected geometry'),
                                         ('BRUTEFORCE', 'Bruteforce', 'Try to import everything that looks like a display list\n(ignores header for maps)'),
                                         ('SMART', 'Smart-ish', 'Minimum + Bruteforce but avoids reading the same display lists several times'),
                                         ('TRY_EVERYTHING', 'Try everything', 'Minimum + Bruteforce'),),
                                  description='How to find display lists to import (try this if there is missing geometry)',
                                  default='NO_DETECTION',)
-    vertexMode = EnumProperty(name="Vtx Mode",
+    vertexMode: EnumProperty(name="Vtx Mode",
                              items=(('COLORS', "COLORS", "Use vertex colors"),
                                     ('NORMALS', "NORMALS", "Use vertex normals as shading"),
                                     ('NONE', "NONE", "Don't use vertex colors or normals"),
                                     ('AUTO', "AUTO", "Switch between normals and vertex colors automatically according to 0xD9 G_GEOMETRYMODE flags"),),
                              description="Legacy option, shouldn't be useful",
                              default='AUTO',)
-    useVertexAlpha = BoolProperty(name="Use vertex alpha",
+    useVertexAlpha: BoolProperty(name="Use vertex alpha",
                                  description="Only enable if your version of blender has native support",
                                  default=(bpy.app.version == (2,79,7) and bpy.app.build_hash in {b'10f724cec5e3', b'e045fe53f1b0'}),)
-    enableMatrices = BoolProperty(name="Matrices",
+    enableMatrices: BoolProperty(name="Matrices",
                                  description="Use 0xDA G_MTX and 0xD8 G_POPMTX commands",
                                  default=True,)
-    detectedDisplayLists_use_transparency = BoolProperty(name="Default to transparency",
+    detectedDisplayLists_use_transparency: BoolProperty(name="Default to transparency",
                                                          description='Set material to use transparency or not for display lists that were detected',
                                                          default=False,)
-    detectedDisplayLists_consider_unimplemented_invalid = BoolProperty(
+    detectedDisplayLists_consider_unimplemented_invalid: BoolProperty(
                                     name='Unimplemented => Invalid',
                                     description='Consider that unimplemented opcodes are invalid when detecting display lists.\n'
                                                 'The reasoning is that unimplemented opcodes are very rare or never actually used.',
                                     default=True,)
-    enablePrimColor = BoolProperty(name="Prim Color",
+    enablePrimColor: BoolProperty(name="Prim Color",
                                   description="Enable blending with primitive color",
                                   default=False,) # this may be nice for strictly importing but exporting again will then not be exact
-    enableEnvColor = BoolProperty(name="Env Color",
+    enableEnvColor: BoolProperty(name="Env Color",
                                  description="Enable blending with environment color",
                                  default=False,) # same as primColor above
-    invertEnvColor = BoolProperty(name="Invert Env Color",
+    invertEnvColor: BoolProperty(name="Invert Env Color",
                                  description="Invert environment color (temporary fix)",
                                  default=False,) # todo what is this?
-    exportTextures = BoolProperty(name="Export Textures",
+    exportTextures: BoolProperty(name="Export Textures",
                                  description="Export textures for the model",
                                  default=True,)
-    importTextures = BoolProperty(name="Import Textures",
+    importTextures: BoolProperty(name="Import Textures",
                                  description="Import textures for the model",
                                  default=True,)
-    enableTexClampBlender = BoolProperty(name="Texture Clamp",
+    enableTexClampBlender: BoolProperty(name="Texture Clamp",
                                  description="Enable texture clamping in Blender, used by Blender in the 3d viewport and by zzconvert",
                                  default=False,)
-    replicateTexMirrorBlender = BoolProperty(name="Texture Mirror",
+    replicateTexMirrorBlender: BoolProperty(name="Texture Mirror",
                                   description="Replicate texture mirroring by writing the textures with the mirrored parts (with double width/height) instead of the initial texture",
                                   default=False,)
-    enableTexClampSharpOcarinaTags = BoolProperty(name="Texture Clamp SO Tags",
+    enableTexClampSharpOcarinaTags: BoolProperty(name="Texture Clamp SO Tags",
                                  description="Add #ClampX and #ClampY tags where necessary in the texture filename, used by SharpOcarina",
                                  default=False,)
-    enableTexMirrorSharpOcarinaTags = BoolProperty(name="Texture Mirror SO Tags",
+    enableTexMirrorSharpOcarinaTags: BoolProperty(name="Texture Mirror SO Tags",
                                   description="Add #MirrorX and #MirrorY tags where necessary in the texture filename, used by SharpOcarina",
                                   default=False,)
-    enableShadelessMaterials = BoolProperty(name="Shadeless Materials",
+    enableShadelessMaterials: BoolProperty(name="Shadeless Materials",
                                   description="Set materials to be shadeless, prevents using environment colors in-game",
                                   default=False,)
-    enableToon = BoolProperty(name="Toony UVs",
+    enableToon: BoolProperty(name="Toony UVs",
                              description="Obtain a toony effect by not scaling down the uv coords",
                              default=False,)
-    originalObjectScale = IntProperty(name="File Scale",
+    originalObjectScale: IntProperty(name="File Scale",
                              description="Scale of imported object, blender model will be scaled 1/(file scale) (use 1 for maps, actors are usually 100, 10 or 1) (0 defaults to 1 for maps and 100 for actors)",
                              default=0, min=0, soft_max=1000)
-    loadAnimations = BoolProperty(name="Load animations",
+    loadAnimations: BoolProperty(name="Load animations",
                              description="For animated actors, load all animations or none",
                              default=True,)
-    MajorasAnims = BoolProperty(name="MajorasAnims",
+    MajorasAnims: BoolProperty(name="MajorasAnims",
                              description="Majora's Mask Link's Anims.",
                              default=False,)
-    ExternalAnimes = BoolProperty(name="ExternalAnimes",
+    ExternalAnimes: BoolProperty(name="ExternalAnimes",
                              description="Load External Animes.",
                              default=False,)
-    prefixMultiImport = BoolProperty(name='Prefix multi-import',
+    prefixMultiImport: BoolProperty(name='Prefix multi-import',
                              description='Add a prefix to imported data (objects, materials, images...) when importing several files at once',
                              default=True,)
-    setView3dParameters = BoolProperty(name="Set 3D View parameters",
+    setView3dParameters: BoolProperty(name="Set 3D View parameters",
                              description="For maps, use a more appropriate grid size and clip distance",
                              default=True,)
-    logging_level = IntProperty(name="Log level",
+    logging_level: IntProperty(name="Log level",
                              description="(logs in the system console) The lower, the more logs. trace=%d debug=%d info=%d" % (logging_trace_level,logging.DEBUG,logging.INFO),
                              default=logging.INFO, min=1, max=51)
-    report_logging_level = IntProperty(name='Report level',
+    report_logging_level: IntProperty(name='Report level',
                              description='What logs to report to Blender. When the import is done, warnings and errors are shown, if any. trace=%d debug=%d info=%d' % (logging_trace_level,logging.DEBUG,logging.INFO),
                              default=logging.INFO, min=1, max=51)
-    logging_logfile_enable = BoolProperty(name='Log to file',
+    logging_logfile_enable: BoolProperty(name='Log to file',
                              description='Log everything (all levels) to a file',
                              default=False,)
-    logging_logfile_path = StringProperty(name='Log file path',
+    logging_logfile_path: StringProperty(name='Log file path',
                              #subtype='FILE_PATH', # cannot use two FILE_PATH at the same time
                              description='File to write logs to\nPath can be relative (to imported file) or absolute',
                              default='log_io_import_z64.txt',)
@@ -2178,7 +2265,14 @@ class ImportZ64(bpy.types.Operator, ImportHelper):
             setLogFile(logfile_path)
         setLogOperator(self, self.report_logging_level)
 
+        # Store original selection to restore later if needed
+        original_selection = [obj for obj in context.selected_objects]
+        original_active = context.active_object
+
         try:
+            # Clear selection but don't delete objects - just deselect
+            bpy.ops.object.select_all(action='DESELECT')
+            
             for file in self.files:
                 filepath = os.path.join(self.directory, file.name)
                 if len(self.files) == 1 or not self.prefixMultiImport:
@@ -2186,7 +2280,12 @@ class ImportZ64(bpy.types.Operator, ImportHelper):
                 else:
                     prefix = file.name + "_"
                 self.executeSingle(filepath, prefix=prefix)
-            bpy.context.scene.update()
+                
+            # Force viewport update after import
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+                    
         finally:
             setLogFile(None)
             setLogOperator(None)
@@ -2276,12 +2375,16 @@ class ImportZ64(bpy.types.Operator, ImportHelper):
             for screen in bpy.data.screens:
                 for area in screen.areas:
                     if area.type == 'VIEW_3D':
+                        space = area.spaces.active
                         if importType == "ROOM":
-                            area.spaces.active.grid_lines = 500
-                            area.spaces.active.grid_scale = 10
-                            area.spaces.active.grid_subdivisions = 10
-                            area.spaces.active.clip_end = 900000
-                        area.spaces.active.viewport_shade = "TEXTURED"
+                            if hasattr(space.overlay, 'grid_scale'):
+                                space.overlay.grid_scale = 10.0
+                            if hasattr(space.overlay, 'grid_subdivisions'):
+                                space.overlay.grid_subdivisions = 10
+                            if hasattr(space, 'clip_end'):
+                                space.clip_end = 900000
+                        if hasattr(space, 'shading'):
+                            space.shading.type = 'SOLID'
 
     def draw(self, context):
         l = self.layout
@@ -2327,17 +2430,23 @@ class ImportZ64(bpy.types.Operator, ImportHelper):
             l.prop(self, 'logging_logfile_path')
 
 def menu_func_import(self, context):
-    self.layout.operator(ImportZ64.bl_idname, text="Zelda64 (.zobj;.zroom;.zmap)")
+    self.layout.operator(IMPORT_OT_zelda64.bl_idname, text="Zelda64 (.zobj;.zroom;.zmap)")
 
+
+classes = (
+    IMPORT_OT_zelda64,
+)
 
 def register():
     registerLogging()
-    bpy.utils.register_module(__name__)
-    bpy.types.INFO_MT_file_import.append(menu_func_import)
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 def unregister():
-    bpy.utils.unregister_module(__name__)
-    bpy.types.INFO_MT_file_import.remove(menu_func_import)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     unregisterLogging()
 
 
