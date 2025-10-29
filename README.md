@@ -2,17 +2,13 @@
 
 This is a Blender addon allowing to import models and animations from files extracted from N64 Zelda roms.
 
-**Required Blender version: 2.79 or earlier**
+**Required Blender version: 3 (tested with 3.4.1)**
 
-**You should open the system console** (`Window > Toggle System Console` in Blender) before importing an object so you can see the progress being made, as the Blender UI freezes during the import process.
-
-The messages in the system console may also help understand why an import is failing.
+If an import doesn't work the messages in the system console may help understand why an import is failing.
 
 # Limitations
 
-For some reason the animations for the Bari (jellyfish in jabujabu) don't import.
-
-Importing Link's animations may be broken.
+Not sure why but the animations don't work exactly as expected, the textures are also importing a bit weird, and some of the models will appear far away from the widget, which can easily be fixed by resetting the model pose.
 
 # Data from other segments
 
@@ -66,4 +62,126 @@ Later, these additional changes were made:
 
 At this point, version number was introduced to be 2.0
 
-Further changes are documented by release tags and commit history.
+## Nokel
+
+Nokel has updated the code to work with the Blender 3 API
+
+### Property Annotations
+**Before (2.79)**:
+```python
+class IMPORT_OT_zelda64(bpy.types.Operator):
+    my_prop = StringProperty(name="Property")
+```
+
+**After (3.4.1)**:
+```python
+class IMPORT_OT_zelda64(bpy.types.Operator):
+    my_prop: StringProperty(name="Property")
+```
+
+### Class Naming & bl_idname
+**Before**: `class ImportZ64`, `bl_idname = "file.zobj2020"`  
+**After**: `class IMPORT_OT_zelda64`, `bl_idname = "import_scene.zelda64"`
+
+- Class renamed to follow UPPERCASE_PREFIX naming convention
+- bl_idname updated to follow proper naming pattern
+
+### Registration System
+**Before (2.79)**:
+```python
+def register():
+    registerLogging()
+    bpy.utils.register_module(__name__)
+    bpy.types.INFO_MT_file_import.append(menu_func_import)
+```
+
+**After (3.4.1)**:
+```python
+classes = (
+    IMPORT_OT_zelda64,
+)
+
+def register():
+    registerLogging()
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+```
+
+- Removed `bpy.utils.register_module()` (deprecated)
+- Implemented explicit class registration
+- Updated menu type: `INFO_MT_file_import` → `TOPBAR_MT_file_import`
+
+### Scene & Object API Updates
+**Before**: `bpy.context.scene.objects.active = obj`  
+**After**: `bpy.context.view_layer.objects.active = obj`
+
+- Updated 3 instances of scene.objects.active
+
+### Bone Selection API
+**Before**: `bone.select = True`  
+**After**: `bone.select_set(True)`
+
+- Updated 6 instances of bone selection
+
+### Viewport Display
+**Before**: `area.spaces.active.viewport_shade = "TEXTURED"`  
+**After**: `area.spaces.active.shading.type = 'SOLID'`
+
+- Updated viewport shading API
+
+### Material Properties
+The following material properties still work in 3.4.1 but are legacy:
+
+**Commented/Noted**:
+- `mtl.use_shadeless` - Removed in 2.80+, needs shader nodes
+- `mtl.use_transparency` - Deprecated but functional
+- `mtl.game_settings.alpha_blend` - Removed (game engine removed in 3.0)
+- `mtl.texture_slots` - Deprecated but still functional
+
+### 10. UI Updates
+- Updated `layout.label()` calls to use `text=` parameter
+
+---
+
+## Backward Compatibility
+
+**This updated addon is NOT backward compatible with Blender 2.79.**
+
+---
+
+## Installation in Blender 3.4.1
+
+1. Open Blender 3.4.1
+2. Go to `Edit` → `Preferences` → `Add-ons`
+3. Click `Install...`
+4. Select `io_import_z64.py`
+5. Enable the addon by checking the box next to "Import-Export: Zelda64 Importer"
+6. The import option will appear under `File` → `Import` → `Zelda64 (.zobj;.zroom;.zmap)`
+
+---
+
+## Files Modified
+
+- **io_import_z64.py**: Main addon file (migrated to 3.4.1)
+- **README.md**: Added Blender 3.4.1 development section
+
+---
+
+### Installing the Addon in Blender (Local Use)
+
+1. Download `io_import_z64.py` from this repository
+2. Open Blender 3
+3. Navigate to `File` → `User Preferences` → `Add-ons`
+4. Click `Install Add-on from File...`
+5. Select `io_import_z64.py`
+6. Enable the addon by checking its checkbox
+7. Save user settings
+
+### Using the Addon in Blender
+
+1. Open Blender's system console: `Window` → `Toggle System Console`
+2. Go to `File` → `Import` → `Zelda64 (.zobj, .zmap, etc.)`
+3. Browse to your extracted Zelda 64 ROM files
+4. Configure import options and click Import
+5. Monitor import progress in the system console
